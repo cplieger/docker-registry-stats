@@ -40,11 +40,6 @@ zero external Go dependencies (stdlib-only).
 - **No historical backfill.** The registries only expose current totals.
   Time-series data is built locally as snapshots accumulate. If you
   start today, you only have data from today forward.
-- **Wildcard expansion adds API calls.** Using `owner/*` requires
-  listing all repos for that owner on each poll cycle. For Docker Hub
-  this is one paginated API call. For GHCR this scrapes the owner's
-  packages page. If the listing fails, only explicitly named repos
-  are collected.
 
 
 ## Container Registries
