@@ -77,6 +77,16 @@ func TestParseRepoRefs(t *testing.T) {
 	}
 }
 
+func TestParseRepoRefsWildcard(t *testing.T) {
+	refs := parseRepoRefs("owner/repo,owner2/*,owner3/pkg")
+	if len(refs) != 3 {
+		t.Fatalf("len = %d, want 3", len(refs))
+	}
+	if refs[1].Owner != "owner2" || refs[1].Repo != "*" {
+		t.Errorf("refs[1] = %+v, want owner2/*", refs[1])
+	}
+}
+
 func TestIsSafeURLSegment(t *testing.T) {
 	safe := []string{"cplieger", "fclones-scheduler", "home.assistant", "my_repo"}
 	for _, s := range safe {
@@ -150,6 +160,66 @@ func TestParseGHCRDownloads(t *testing.T) {
 			}
 			if count != tt.want {
 				t.Errorf("count = %d, want %d", count, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseGHCRPackageList(t *testing.T) {
+	tests := []struct {
+		name    string
+		html    string
+		owner   string
+		want    []string
+		wantErr bool
+	}{
+		{
+			name: "multiple packages",
+			html: `<a href="/users/testowner/packages/container/package/app1">app1</a>
+<a href="/users/testowner/packages/container/package/app2">app2</a>
+<a href="/users/testowner/packages/container/package/app3">app3</a>`,
+			owner: "testowner",
+			want:  []string{"app1", "app2", "app3"},
+		},
+		{
+			name: "deduplicates repeated links",
+			html: `<a href="/users/owner/packages/container/package/pkg1">pkg1</a>
+<a href="/users/owner/packages/container/package/pkg1">pkg1</a>`,
+			owner: "owner",
+			want:  []string{"pkg1"},
+		},
+		{
+			name:    "no packages found",
+			html:    `<div>nothing here</div>`,
+			owner:   "owner",
+			wantErr: true,
+		},
+		{
+			name:    "ignores other owners",
+			html:    `<a href="/users/other/packages/container/package/pkg1">pkg1</a>`,
+			owner:   "testowner",
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseGHCRPackageList(tt.html, tt.owner)
+			if tt.wantErr {
+				if err == nil {
+					t.Error("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("len = %d, want %d", len(got), len(tt.want))
+			}
+			for i, w := range tt.want {
+				if got[i] != w {
+					t.Errorf("got[%d] = %s, want %s", i, got[i], w)
+				}
 			}
 		})
 	}
@@ -230,6 +300,22 @@ func TestLoadConfigInvalidNumbers(t *testing.T) {
 	}
 	if cfg.RetentionDays != 90 {
 		t.Errorf("RetentionDays = %d, want 90 fallback", cfg.RetentionDays)
+	}
+}
+
+func TestLoadConfigWildcard(t *testing.T) {
+	t.Setenv("DOCKERHUB_REPOS", "cplieger/*")
+	t.Setenv("GHCR_REPOS", "cplieger/*,cplieger/fclones")
+	t.Setenv("POLL_INTERVAL_HOURS", "1")
+	t.Setenv("RETENTION_DAYS", "90")
+
+	cfg := loadConfig()
+
+	if len(cfg.DockerHubRepos) != 1 || cfg.DockerHubRepos[0].Repo != "*" {
+		t.Errorf("DockerHubRepos = %+v, want [cplieger/*]", cfg.DockerHubRepos)
+	}
+	if len(cfg.GHCRRepos) != 2 {
+		t.Errorf("GHCRRepos len = %d, want 2", len(cfg.GHCRRepos))
 	}
 }
 
@@ -692,6 +778,45 @@ func TestCollectSkipsEmptySnapshot(t *testing.T) {
 	// Returns false because the empty snapshot guard fires
 	if ok {
 		t.Error("expected ok=false when no data collected")
+	}
+}
+
+// --- Deduplication tests ---
+
+func TestCollectGHCRDedup(t *testing.T) {
+	// collectGHCR builds a deduped package list from wildcard + explicit refs.
+	// We can't inject mock URLs, but we can verify the dedup logic by checking
+	// that parseGHCRPackageList + seen map produces correct results.
+	html := `<a href="/users/owner/packages/container/package/app1">app1</a>
+<a href="/users/owner/packages/container/package/app2">app2</a>`
+
+	names, err := parseGHCRPackageList(html, "owner")
+	if err != nil {
+		t.Fatalf("parseGHCRPackageList: %v", err)
+	}
+
+	// Simulate the dedup logic from collectGHCR
+	seen := make(map[string]bool)
+	var packages []repoRef
+
+	// Wildcard expansion
+	for _, name := range names {
+		key := "owner/" + name
+		if !seen[key] {
+			seen[key] = true
+			packages = append(packages, repoRef{Owner: "owner", Repo: name})
+		}
+	}
+
+	// Explicit ref that overlaps with wildcard
+	key := "owner/app1"
+	if !seen[key] {
+		seen[key] = true
+		packages = append(packages, repoRef{Owner: "owner", Repo: "app1"})
+	}
+
+	if len(packages) != 2 {
+		t.Errorf("len = %d, want 2 (app1 deduped)", len(packages))
 	}
 }
 

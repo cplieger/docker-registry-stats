@@ -2,6 +2,6 @@
 
 ## 2026.03.07 (2026-03-07)
 
-### Changed
+### Added
 
-- Rebuilt with updated publishing pipeline
+- add wildcard support for Docker Hub and GHCR repos

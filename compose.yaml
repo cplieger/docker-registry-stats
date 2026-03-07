@@ -8,8 +8,8 @@ services:
 
     environment:
       TZ: "Europe/Paris"
-      DOCKERHUB_REPOS: "owner1/app1,owner2/app2"  # owner/repo format, comma-separated
-      GHCR_REPOS: "owner1/app1,owner2/app2"  # owner/package format, comma-separated
+      DOCKERHUB_REPOS: "owner1/*,owner2/app2"  # owner/repo or owner/* format, comma-separated
+      GHCR_REPOS: "owner1/*,owner2/app2"  # owner/package or owner/* format, comma-separated
       POLL_INTERVAL_HOURS: "1"  # 0 = collect once then serve
       RETENTION_DAYS: "90"  # 0 = keep forever
 

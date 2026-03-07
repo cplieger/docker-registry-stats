@@ -14,6 +14,11 @@ Collects download statistics from Docker Hub and GHCR for your public
 container images and serves the data via a lightweight HTTP API. Designed
 for Grafana dashboards but works with any tool that can query JSON APIs.
 
+Supports both explicit repos (`myuser/myapp`) and owner wildcards
+(`myuser/*`) to automatically discover and track all public repos
+for an owner. Wildcards are resolved on each poll cycle, so newly
+published images are picked up automatically.
+
 Data is stored as one JSON file per day, overwritten on each poll cycle.
 Old snapshots are automatically pruned based on a configurable retention
 period. Historical time-series data builds up locally as snapshots
@@ -28,13 +33,18 @@ zero external Go dependencies (stdlib-only).
 - **Public repositories only.** Docker Hub uses the unauthenticated API.
   GHCR download counts are scraped from public package pages. Private
   repositories and packages are not supported.
-- **GHCR scraping is fragile.** Download counts are extracted from
-  GitHub's HTML, not an official API. If GitHub changes their page
-  structure, scraping will break. The container logs a clear error
-  with a link to open an issue when this happens.
+- **GHCR scraping is fragile.** Download counts and package listings
+  are extracted from GitHub's HTML, not an official API. If GitHub
+  changes their page structure, scraping will break. The container
+  logs a clear error with a link to open an issue when this happens.
 - **No historical backfill.** The registries only expose current totals.
   Time-series data is built locally as snapshots accumulate. If you
   start today, you only have data from today forward.
+- **Wildcard expansion adds API calls.** Using `owner/*` requires
+  listing all repos for that owner on each poll cycle. For Docker Hub
+  this is one paginated API call. For GHCR this scrapes the owner's
+  packages page. If the listing fails, only explicitly named repos
+  are collected.
 
 
 ## Container Registries
@@ -69,8 +79,8 @@ services:
 
     environment:
       TZ: "Europe/Paris"
-      DOCKERHUB_REPOS: "owner1/app1,owner2/app2"  # owner/repo format, comma-separated
-      GHCR_REPOS: "owner1/app1,owner2/app2"  # owner/package format, comma-separated
+      DOCKERHUB_REPOS: "owner1/*,owner2/app2"  # owner/repo or owner/* format, comma-separated
+      GHCR_REPOS: "owner1/*,owner2/app2"  # owner/package or owner/* format, comma-separated
       POLL_INTERVAL_HOURS: "1"  # 0 = collect once then serve
       RETENTION_DAYS: "90"  # 0 = keep forever
 
@@ -95,14 +105,22 @@ services:
 
 1. Set `DOCKERHUB_REPOS` to a comma-separated list of Docker Hub
    repositories in `owner/repo` format
-   (e.g. `myuser/myapp,myuser/otherapp`).
+   (e.g. `myuser/myapp,myuser/otherapp`). Use `owner/*` to
+   automatically track all public repos for an owner
+   (e.g. `myuser/*`).
 2. Set `GHCR_REPOS` to a comma-separated list of public GHCR packages
-   in `owner/package` format. Only public packages are supported.
-3. Mount a persistent directory to `/data` for snapshot storage.
-4. The container starts collecting immediately and serves the HTTP API
+   in `owner/package` format. Use `owner/*` to automatically track
+   all public packages for an owner. Only public packages are
+   supported.
+3. You can mix wildcards and explicit refs freely
+   (e.g. `myuser/*,otheruser/specific-app`). Duplicates are
+   automatically deduplicated — if `myuser/*` discovers `myapp` and
+   you also list `myuser/myapp`, it's only collected once.
+4. Mount a persistent directory to `/data` for snapshot storage.
+5. The container starts collecting immediately and serves the HTTP API
    on port 9100. With the default 1-hour poll interval, you'll have
    your first data point within minutes.
-5. For Grafana integration, see the
+6. For Grafana integration, see the
    [Grafana Integration](#grafana-integration) section below. If you
    use a different dashboard tool, see the
    [API Reference](#api-reference) for endpoint documentation and
@@ -114,9 +132,9 @@ services:
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
 | `TZ` | Container timezone | `Europe/Paris` | No |
-| `DOCKERHUB_REPOS` | Comma-separated list of Docker Hub repositories to track, in `owner/repo` format (e.g. `myuser/myapp,myuser/otherapp`) | `owner1/app1,owner2/app2` | No |
-| `GHCR_REPOS` | Comma-separated list of public GHCR packages to track, in `owner/package` format (e.g. `myuser/myapp,myuser/otherapp`) | `owner1/app1,owner2/app2` | No |
-| `POLL_INTERVAL_HOURS` | Hours between collection cycles. Set to 0 to collect once and then only serve the API (no recurring polls) | `1` | No |
+| `DOCKERHUB_REPOS` | Comma-separated list of Docker Hub repositories to track. Use `owner/repo` for specific repos or `owner/*` to auto-discover all public repos for an owner (e.g. `myuser/*,otheruser/specific-app`) | `owner1/*,owner2/app2` | No |
+| `GHCR_REPOS` | Comma-separated list of public GHCR packages to track. Use `owner/package` for specific packages or `owner/*` to auto-discover all public packages for an owner (e.g. `myuser/*,otheruser/specific-app`) | `owner1/*,owner2/app2` | No |
+| `POLL_INTERVAL_HOURS` | Hours between collection cycles. Set to 0 to collect once and then only serve the API (no recurring polls). Wildcards are re-expanded on each cycle, picking up newly published images | `1` | No |
 | `RETENTION_DAYS` | Number of days to keep snapshot files. Older snapshots are automatically deleted. Set to 0 to keep all snapshots forever | `90` | No |
 
 
@@ -272,7 +290,9 @@ The dashboard includes:
   day (requires 2+ days of data)
 
 Both the **Repository** and **Registry** dropdowns are dynamic and
-populate automatically from your configured packages.
+populate automatically from your configured packages. When using
+wildcards, newly discovered repos appear in the dropdowns on the
+next poll cycle without any dashboard changes.
 
 ### 4. Customization
 
@@ -292,6 +312,8 @@ at `/tmp/.healthy`. The `health` subcommand checks for this file.
   are tolerated — one successful repo keeps the container healthy)
 - All configured GHCR packages fail to scrape
 - The snapshot file cannot be written to disk
+- Wildcard expansion failures alone do not cause unhealthy status
+  if explicit repos still succeed
 
 **When it recovers:**
 - The next collection cycle where at least one registry responds

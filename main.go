@@ -11,7 +11,6 @@ package main
 // The HTTP API serves current + historical data for Grafana dashboards.
 
 import (
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -44,18 +43,17 @@ var (
 // --- Configuration ---
 
 type config struct {
-	// Docker Hub (public repos, owner/repo format e.g. "cplieger/fclones,linuxserver/sonarr")
+	// Docker Hub repos: "owner/repo" or "owner/*" (wildcard = all public repos)
 	DockerHubRepos []repoRef
-
-	// GHCR (public packages, owner/repo format e.g. "cplieger/caddy,home-assistant/home-assistant")
+	// GHCR packages: "owner/repo" or "owner/*" (wildcard = all public packages)
 	GHCRRepos []repoRef
-
 	// General
 	PollInterval  time.Duration // time between collections (0 = one-shot, collect once then serve)
 	RetentionDays int           // auto-delete snapshots older than this (0 = keep forever)
 }
 
 // repoRef is an owner/repo pair parsed from env var input.
+// Repo is "*" for wildcard refs that expand at collection time.
 type repoRef struct {
 	Owner string
 	Repo  string
@@ -97,6 +95,8 @@ type ghcrStats struct {
 }
 
 func main() {
+	// CLI health probe for Docker healthcheck (distroless has no curl/wget).
+	// Checks for a marker file instead of making an HTTP request — no port needed.
 	if len(os.Args) > 1 && os.Args[1] == "health" {
 		if _, err := os.Stat(healthFile); err != nil {
 			os.Exit(1)
@@ -129,7 +129,7 @@ func main() {
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				log.Println("Shutting down")
+				log.Printf("Shutting down (%v)", context.Cause(ctx))
 				shutdownServer(srv)
 				return
 			case <-timer.C:
@@ -140,7 +140,7 @@ func main() {
 	}
 
 	<-ctx.Done()
-	log.Println("Shutting down")
+	log.Printf("Shutting down (%v)", context.Cause(ctx))
 	shutdownServer(srv)
 }
 
@@ -163,36 +163,35 @@ func loadConfig() config {
 }
 
 func logConfig(cfg *config) {
-	log.Printf("Docker Hub: %d repos", len(cfg.DockerHubRepos))
+	log.Printf("Docker Hub: %d repo refs", len(cfg.DockerHubRepos))
 	for _, r := range cfg.DockerHubRepos {
 		log.Printf("  - %s/%s", r.Owner, r.Repo)
 	}
-	log.Printf("GHCR: %d packages", len(cfg.GHCRRepos))
+	log.Printf("GHCR: %d package refs", len(cfg.GHCRRepos))
 	for _, r := range cfg.GHCRRepos {
 		log.Printf("  - %s/%s", r.Owner, r.Repo)
 	}
 	log.Printf("Poll: %s | Retention: %d days", cfg.PollInterval, cfg.RetentionDays)
 }
 
-// parseRepoRefs parses a comma-separated list of "owner/repo" pairs.
+// parseRepoRefs parses a comma-separated list of "owner/repo" or "owner/*" pairs.
 // Invalid entries (missing slash, unsafe characters) are skipped with a warning.
 func parseRepoRefs(s string) []repoRef {
 	if s == "" {
 		return nil
 	}
-	parts := strings.Split(s, ",")
-	refs := make([]repoRef, 0, len(parts))
-	for _, p := range parts {
+	var refs []repoRef
+	for p := range strings.SplitSeq(s, ",") {
 		p = strings.TrimSpace(p)
 		if p == "" {
 			continue
 		}
 		owner, repo, ok := strings.Cut(p, "/")
 		if !ok || owner == "" || repo == "" {
-			log.Printf("WARNING: skipping invalid repo ref (expected owner/repo): %s", p)
+			log.Printf("WARNING: skipping invalid repo ref (expected owner/repo or owner/*): %s", p)
 			continue
 		}
-		if !isSafeURLSegment(owner) || !isSafeURLSegment(repo) {
+		if !isSafeURLSegment(owner) || (repo != "*" && !isSafeURLSegment(repo)) {
 			log.Printf("WARNING: skipping repo ref with unsafe characters: %s", p)
 			continue
 		}
@@ -214,7 +213,7 @@ func collect(ctx context.Context, cfg *config) bool {
 	ok := true
 
 	if len(cfg.DockerHubRepos) > 0 {
-		dh := collectDockerHub(ctx, client, cfg)
+		dh := collectDockerHub(ctx, client, cfg.DockerHubRepos)
 		if len(dh) == 0 {
 			ok = false
 		}
@@ -222,7 +221,7 @@ func collect(ctx context.Context, cfg *config) bool {
 	}
 
 	if len(cfg.GHCRRepos) > 0 {
-		gh, healthy := collectGHCR(ctx, client, cfg)
+		gh, healthy := collectGHCR(ctx, client, cfg.GHCRRepos)
 		if !healthy {
 			ok = false
 		}
@@ -244,15 +243,51 @@ func collect(ctx context.Context, cfg *config) bool {
 	return ok
 }
 
-func collectDockerHub(ctx context.Context, client *http.Client, cfg *config) []repoStats {
-	results := make([]repoStats, 0, len(cfg.DockerHubRepos))
+// collectDockerHub collects stats for all configured Docker Hub repos.
+// Wildcard refs (owner/*) are expanded via the owner listing endpoint, which
+// already returns pull_count and last_updated — avoiding per-repo API calls.
+// Explicit refs use the per-repo endpoint. Results are deduplicated.
+func collectDockerHub(ctx context.Context, client *http.Client, refs []repoRef) []repoStats {
+	var results []repoStats
+	seen := make(map[string]bool)
 
-	for _, ref := range cfg.DockerHubRepos {
-		repoURL := fmt.Sprintf("https://hub.docker.com/v2/repositories/%s/%s/",
-			ref.Owner, ref.Repo)
+	// Collect wildcard owners first (bulk endpoint has pull counts built in)
+	for _, ref := range refs {
+		if ref.Repo != "*" {
+			continue
+		}
+		repos, err := listDockerHubRepos(ctx, client, ref.Owner)
+		if err != nil {
+			log.Printf("ERROR: Docker Hub listing failed for %s/*: %v", ref.Owner, err)
+			continue
+		}
+		for i, r := range repos {
+			if seen[r.Repo] {
+				continue
+			}
+			seen[r.Repo] = true
+			repos[i].Tags = collectDockerHubTags(ctx, client, r.Repo)
+			results = append(results, repos[i])
+			log.Printf("Docker Hub: %s — %d pulls, %d tags", r.Repo, r.PullCount, len(repos[i].Tags))
+		}
+		log.Printf("Docker Hub wildcard %s/*: discovered %d repos", ref.Owner, len(repos))
+	}
+
+	// Collect explicit refs (skip if already covered by a wildcard)
+	for _, ref := range refs {
+		if ref.Repo == "*" {
+			continue
+		}
+		name := ref.Owner + "/" + ref.Repo
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+
+		repoURL := fmt.Sprintf("https://hub.docker.com/v2/repositories/%s/%s/", ref.Owner, ref.Repo)
 		repoData, err := doGet(ctx, client, repoURL)
 		if err != nil {
-			log.Printf("ERROR: Docker Hub fetch failed for %s/%s: %v", ref.Owner, ref.Repo, err)
+			log.Printf("ERROR: Docker Hub fetch failed for %s: %v", name, err)
 			continue
 		}
 
@@ -261,39 +296,34 @@ func collectDockerHub(ctx context.Context, client *http.Client, cfg *config) []r
 			PullCount   int64  `json:"pull_count"`
 		}
 		if err := json.Unmarshal(repoData, &repoResp); err != nil {
-			log.Printf("ERROR: Docker Hub parse failed for %s/%s: %v", ref.Owner, ref.Repo, err)
+			log.Printf("ERROR: Docker Hub parse failed for %s: %v", name, err)
 			continue
 		}
 
-		tags := collectDockerHubTags(ctx, client, ref)
-
+		tags := collectDockerHubTags(ctx, client, name)
 		results = append(results, repoStats{
-			Repo:        ref.Owner + "/" + ref.Repo,
+			Repo:        name,
 			PullCount:   repoResp.PullCount,
 			LastUpdated: repoResp.LastUpdated,
 			Tags:        tags,
 		})
-
-		log.Printf("Docker Hub: %s/%s — %d pulls, %d tags",
-			ref.Owner, ref.Repo, repoResp.PullCount, len(tags))
+		log.Printf("Docker Hub: %s — %d pulls, %d tags", name, repoResp.PullCount, len(tags))
 	}
 
 	return results
 }
 
-func collectDockerHubTags(ctx context.Context, client *http.Client, ref repoRef) []tagInfo {
-	var tags []tagInfo
-	const maxPages = 50
+// listDockerHubRepos paginates the Docker Hub owner listing endpoint.
+// Returns repoStats with Repo, PullCount, and LastUpdated populated (Tags left nil).
+func listDockerHubRepos(ctx context.Context, client *http.Client, owner string) ([]repoStats, error) {
+	var repos []repoStats
+	const maxPages = 10
 
 	for page := 1; page <= maxPages; page++ {
-		tagsURL := fmt.Sprintf(
-			"https://hub.docker.com/v2/repositories/%s/%s/tags/?page_size=100&page=%d",
-			ref.Owner, ref.Repo, page)
-		data, err := doGet(ctx, client, tagsURL)
+		url := fmt.Sprintf("https://hub.docker.com/v2/repositories/%s/?page_size=100&page=%d", owner, page)
+		data, err := doGet(ctx, client, url)
 		if err != nil {
-			log.Printf("ERROR: Docker Hub tags fetch failed for %s/%s page %d: %v",
-				ref.Owner, ref.Repo, page, err)
-			break
+			return repos, fmt.Errorf("list repos page %d: %w", page, err)
 		}
 
 		var resp struct {
@@ -301,38 +331,54 @@ func collectDockerHubTags(ctx context.Context, client *http.Client, ref repoRef)
 			Results []struct {
 				Name        string `json:"name"`
 				LastUpdated string `json:"last_updated"`
-				Digest      string `json:"digest"`
-				Images      []struct {
-					Architecture string `json:"architecture"`
-					OS           string `json:"os"`
-					Digest       string `json:"digest"`
-					Size         int64  `json:"size"`
-				} `json:"images"`
-				FullSize int64 `json:"full_size"`
+				PullCount   int64  `json:"pull_count"`
 			} `json:"results"`
 		}
 		if err := json.Unmarshal(data, &resp); err != nil {
-			log.Printf("ERROR: Docker Hub tags parse failed for %s/%s: %v", ref.Owner, ref.Repo, err)
+			return repos, fmt.Errorf("parse repo list: %w", err)
+		}
+
+		for _, r := range resp.Results {
+			repos = append(repos, repoStats{
+				Repo:        owner + "/" + r.Name,
+				PullCount:   r.PullCount,
+				LastUpdated: r.LastUpdated,
+			})
+		}
+
+		if resp.Next == "" {
+			break
+		}
+	}
+
+	return repos, nil
+}
+
+// collectDockerHubTags fetches all tags for a Docker Hub repo (owner/name format).
+func collectDockerHubTags(ctx context.Context, client *http.Client, repo string) []tagInfo {
+	var tags []tagInfo
+	const maxPages = 50
+
+	for page := 1; page <= maxPages; page++ {
+		tagsURL := fmt.Sprintf(
+			"https://hub.docker.com/v2/repositories/%s/tags/?page_size=100&page=%d",
+			repo, page)
+		data, err := doGet(ctx, client, tagsURL)
+		if err != nil {
+			log.Printf("ERROR: Docker Hub tags fetch failed for %s page %d: %v", repo, page, err)
 			break
 		}
 
-		for _, t := range resp.Results {
-			ti := tagInfo{
-				Name:        t.Name,
-				LastUpdated: t.LastUpdated,
-				FullSize:    t.FullSize,
-				Digest:      t.Digest,
-			}
-			for _, img := range t.Images {
-				ti.Images = append(ti.Images, imageInfo{
-					Architecture: img.Architecture,
-					OS:           img.OS,
-					Size:         img.Size,
-					Digest:       img.Digest,
-				})
-			}
-			tags = append(tags, ti)
+		var resp struct {
+			Next    string    `json:"next"`
+			Results []tagInfo `json:"results"`
 		}
+		if err := json.Unmarshal(data, &resp); err != nil {
+			log.Printf("ERROR: Docker Hub tags parse failed for %s: %v", repo, err)
+			break
+		}
+
+		tags = append(tags, resp.Results...)
 
 		if resp.Next == "" {
 			break
@@ -342,14 +388,49 @@ func collectDockerHubTags(ctx context.Context, client *http.Client, ref repoRef)
 	return tags
 }
 
-func collectGHCR(ctx context.Context, client *http.Client, cfg *config) ([]ghcrStats, bool) {
-	results := make([]ghcrStats, 0, len(cfg.GHCRRepos))
+// collectGHCR collects download counts for all configured GHCR packages.
+// Wildcard refs (owner/*) are expanded by scraping the owner's packages page,
+// then each package is scraped individually. Results are deduplicated.
+func collectGHCR(ctx context.Context, client *http.Client, refs []repoRef) ([]ghcrStats, bool) {
+	var results []ghcrStats
+	seen := make(map[string]bool)
 	failures := 0
 	parseFailures := 0
+	total := 0
 
-	for i, ref := range cfg.GHCRRepos {
+	// Build the full list of packages to scrape (wildcards first, then explicit)
+	var packages []repoRef
+	for _, ref := range refs {
+		if ref.Repo != "*" {
+			continue
+		}
+		names, err := scrapeGHCRPackageList(ctx, client, ref.Owner)
+		if err != nil {
+			log.Printf("ERROR: GHCR package listing failed for %s/*: %v", ref.Owner, err)
+			continue
+		}
+		for _, name := range names {
+			key := ref.Owner + "/" + name
+			if !seen[key] {
+				seen[key] = true
+				packages = append(packages, repoRef{Owner: ref.Owner, Repo: name})
+			}
+		}
+		log.Printf("GHCR wildcard %s/*: discovered %d packages", ref.Owner, len(names))
+	}
+	for _, ref := range refs {
+		if ref.Repo == "*" {
+			continue
+		}
+		key := ref.Owner + "/" + ref.Repo
+		if !seen[key] {
+			seen[key] = true
+			packages = append(packages, ref)
+		}
+	}
+
+	for i, ref := range packages {
 		// Space out requests with randomized delay to avoid rate limits
-		// and reduce bot-like access patterns.
 		if i > 0 {
 			delay := 2*time.Second + time.Duration(rand.IntN(3000))*time.Millisecond
 			timer := time.NewTimer(delay)
@@ -361,6 +442,7 @@ func collectGHCR(ctx context.Context, client *http.Client, cfg *config) ([]ghcrS
 			}
 		}
 
+		total++
 		downloads, err := scrapeGHCRDownloads(ctx, client, ref.Owner, ref.Repo)
 		if err != nil {
 			log.Printf("WARNING: GHCR scrape failed for %s/%s: %v", ref.Owner, ref.Repo, err)
@@ -374,98 +456,139 @@ func collectGHCR(ctx context.Context, client *http.Client, cfg *config) ([]ghcrS
 			Package:       ref.Owner + "/" + ref.Repo,
 			DownloadCount: downloads,
 		})
-
 		log.Printf("GHCR: %s/%s — %d downloads", ref.Owner, ref.Repo, downloads)
 	}
 
-	if parseFailures == len(cfg.GHCRRepos) {
+	if total > 0 && parseFailures == total {
 		log.Println("ERROR: GHCR HTML format may have changed — all download scrapes failed")
 		log.Println("ERROR: please open an issue at https://github.com/cplieger/docker-registry-stats/issues so the maintainer can update the scraper")
 	}
 
-	healthy := failures < len(cfg.GHCRRepos)
+	healthy := total == 0 || failures < total
 	return results, healthy
 }
+
+// --- GHCR HTML scraping ---
 
 // errHTMLFormatChanged is a sentinel error indicating the GitHub package page
 // HTML structure has changed and download counts can no longer be parsed.
 var errHTMLFormatChanged = errors.New("GHCR HTML format changed")
 
-// scrapeGHCRDownloads fetches the public GitHub package page and extracts
-// the "Total downloads" count from the HTML.
-func scrapeGHCRDownloads(ctx context.Context, client *http.Client, owner, pkg string) (int64, error) {
-	pageURL := fmt.Sprintf("https://github.com/users/%s/packages/container/package/%s", owner, pkg)
-
+// fetchGitHubHTML fetches a GitHub page with browser-like headers.
+// Shared by both the package list scraper and the download count scraper.
+func fetchGitHubHTML(ctx context.Context, client *http.Client, pageURL string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, http.NoBody)
 	if err != nil {
-		return 0, fmt.Errorf("create request: %w", err)
+		return "", fmt.Errorf("create request: %w", err)
 	}
 
 	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
 	req.Header.Set("Accept", "text/html")
-	req.Header.Set("Accept-Encoding", "gzip")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("fetch package page: %w", err)
+		return "", fmt.Errorf("fetch page: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("package page returned HTTP %d", resp.StatusCode)
-	}
-
-	var reader io.Reader = resp.Body
-	if resp.Header.Get("Content-Encoding") == "gzip" {
-		gr, gzErr := gzip.NewReader(resp.Body)
-		if gzErr != nil {
-			return 0, fmt.Errorf("gzip reader: %w", gzErr)
-		}
-		defer gr.Close()
-		reader = gr
+		return "", fmt.Errorf("page returned HTTP %d", resp.StatusCode)
 	}
 
 	const maxBody = 2 << 20
-	body, err := io.ReadAll(io.LimitReader(reader, maxBody))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 	if err != nil {
-		return 0, fmt.Errorf("read body: %w", err)
+		return "", fmt.Errorf("read body: %w", err)
 	}
 
-	return parseGHCRDownloads(string(body))
+	return string(body), nil
+}
+
+// scrapeGHCRPackageList fetches the owner's packages page and extracts package names.
+func scrapeGHCRPackageList(ctx context.Context, client *http.Client, owner string) ([]string, error) {
+	pageURL := fmt.Sprintf("https://github.com/users/%s/packages", owner)
+	html, err := fetchGitHubHTML(ctx, client, pageURL)
+	if err != nil {
+		return nil, err
+	}
+	return parseGHCRPackageList(html, owner)
+}
+
+// parseGHCRPackageList extracts package names from the GitHub user packages page HTML.
+// Looks for links matching /users/{owner}/packages/container/package/{name}.
+func parseGHCRPackageList(html, owner string) ([]string, error) {
+	prefix := fmt.Sprintf("/users/%s/packages/container/package/", owner)
+	var packages []string
+	seen := make(map[string]bool)
+
+	for line := range strings.SplitSeq(html, "\n") {
+		for {
+			idx := strings.Index(line, prefix)
+			if idx == -1 {
+				break
+			}
+			line = line[idx+len(prefix):]
+			end := strings.IndexAny(line, `"'<>`)
+			if end == -1 {
+				break
+			}
+			name := line[:end]
+			if name != "" && !seen[name] && isSafeURLSegment(name) {
+				seen[name] = true
+				packages = append(packages, name)
+			}
+		}
+	}
+
+	if len(packages) == 0 {
+		return nil, fmt.Errorf("no packages found on %s's packages page (HTML format may have changed)", owner)
+	}
+
+	return packages, nil
+}
+
+// scrapeGHCRDownloads fetches a single package page and extracts the download count.
+func scrapeGHCRDownloads(ctx context.Context, client *http.Client, owner, pkg string) (int64, error) {
+	pageURL := fmt.Sprintf("https://github.com/users/%s/packages/container/package/%s", owner, pkg)
+	html, err := fetchGitHubHTML(ctx, client, pageURL)
+	if err != nil {
+		return 0, err
+	}
+	return parseGHCRDownloads(html)
 }
 
 // parseGHCRDownloads extracts the download count from GitHub package page HTML.
 // Looks for "Total downloads" text, then extracts the number from the title
 // attribute of the next line (e.g. <h3 title="12345">12.3K</h3>).
 func parseGHCRDownloads(html string) (int64, error) {
-	lines := strings.Split(html, "\n")
-	for i, line := range lines {
-		if !strings.Contains(line, "Total downloads") {
-			continue
+	foundMarker := false
+	for line := range strings.SplitSeq(html, "\n") {
+		if foundMarker {
+			trimmed := strings.TrimSpace(line)
+			titleStart := strings.Index(trimmed, `title="`)
+			if titleStart == -1 {
+				return 0, errHTMLFormatChanged
+			}
+			titleStart += len(`title="`)
+			titleEnd := strings.Index(trimmed[titleStart:], `"`)
+			if titleEnd == -1 {
+				return 0, errHTMLFormatChanged
+			}
+			count, err := strconv.ParseInt(trimmed[titleStart:titleStart+titleEnd], 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("%w: parse count: %w", errHTMLFormatChanged, err)
+			}
+			return count, nil
 		}
-		if i+1 >= len(lines) {
-			return 0, errHTMLFormatChanged
+		if strings.Contains(line, "Total downloads") {
+			foundMarker = true
 		}
-		nextLine := strings.TrimSpace(lines[i+1])
-
-		titleStart := strings.Index(nextLine, `title="`)
-		if titleStart == -1 {
-			return 0, errHTMLFormatChanged
-		}
-		titleStart += len(`title="`)
-		titleEnd := strings.Index(nextLine[titleStart:], `"`)
-		if titleEnd == -1 {
-			return 0, errHTMLFormatChanged
-		}
-
-		count, err := strconv.ParseInt(nextLine[titleStart:titleStart+titleEnd], 10, 64)
-		if err != nil {
-			return 0, fmt.Errorf("%w: parse count: %w", errHTMLFormatChanged, err)
-		}
-		return count, nil
 	}
 
+	if foundMarker {
+		return 0, errHTMLFormatChanged // marker was on the last line, no next line
+	}
 	return 0, errHTMLFormatChanged
 }
 
@@ -639,7 +762,6 @@ func registryIncludes(filter string) (hub, ghcr bool) {
 
 // filteredPulls extracts repo pull data from a snapshot, applying repo and registry filters.
 // When the same package appears in both registries, their pull counts are summed.
-// repoFilter can be empty (no filter), a single "owner/repo", or comma-separated for multi-select.
 func filteredPulls(snap *snapshot, repoFilter []string, registryFilter string) []repoPull {
 	repos := parseRepoFilter(repoFilter)
 	merged := map[string]int64{}
