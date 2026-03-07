@@ -114,7 +114,7 @@ services:
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
 | `TZ` | Container timezone | `Europe/Paris` | No |
-| `DOCKERHUB_REPOS` | Comma-separated list of Docker Hub repositories to track, in `owner/repo` format (e.g. `myuser/myapp,myuser/otherapp`) | `owner1/app1,owner2/app2` | Yes |
+| `DOCKERHUB_REPOS` | Comma-separated list of Docker Hub repositories to track, in `owner/repo` format (e.g. `myuser/myapp,myuser/otherapp`) | `owner1/app1,owner2/app2` | No |
 | `GHCR_REPOS` | Comma-separated list of public GHCR packages to track, in `owner/package` format (e.g. `myuser/myapp,myuser/otherapp`) | `owner1/app1,owner2/app2` | No |
 | `POLL_INTERVAL_HOURS` | Hours between collection cycles. Set to 0 to collect once and then only serve the API (no recurring polls) | `1` | No |
 | `RETENTION_DAYS` | Number of days to keep snapshot files. Older snapshots are automatically deleted. Set to 0 to keep all snapshots forever | `90` | No |
@@ -303,8 +303,7 @@ the next successful poll.
 
 To check health manually:
 ```bash
-docker inspect --format='{{json .State.Health.Log}}' registry-stats \
-  | python3 -m json.tool
+docker inspect --format='{{json .State.Health.Log}}' registry-stats | python3 -m json.tool
 ```
 
 | Type | Command | Meaning |
