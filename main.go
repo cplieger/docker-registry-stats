@@ -564,31 +564,34 @@ func scrapeGHCRDownloads(ctx context.Context, client *http.Client, owner, pkg st
 func parseGHCRDownloads(html string) (int64, error) {
 	foundMarker := false
 	for line := range strings.SplitSeq(html, "\n") {
-		if foundMarker {
-			trimmed := strings.TrimSpace(line)
-			titleStart := strings.Index(trimmed, `title="`)
-			if titleStart == -1 {
-				return 0, errHTMLFormatChanged
+		if !foundMarker {
+			if strings.Contains(line, "Total downloads") {
+				foundMarker = true
 			}
-			titleStart += len(`title="`)
-			titleEnd := strings.Index(trimmed[titleStart:], `"`)
-			if titleEnd == -1 {
-				return 0, errHTMLFormatChanged
-			}
-			count, err := strconv.ParseInt(trimmed[titleStart:titleStart+titleEnd], 10, 64)
-			if err != nil {
-				return 0, fmt.Errorf("%w: parse count: %w", errHTMLFormatChanged, err)
-			}
-			return count, nil
+			continue
 		}
-		if strings.Contains(line, "Total downloads") {
-			foundMarker = true
+
+		// Parse the title="N" attribute from the line after "Total downloads"
+		trimmed := strings.TrimSpace(line)
+		titleStart := strings.Index(trimmed, `title="`)
+		if titleStart == -1 {
+			return 0, errHTMLFormatChanged
 		}
+		titleStart += len(`title="`)
+		titleEnd := strings.Index(trimmed[titleStart:], `"`)
+		if titleEnd == -1 {
+			return 0, errHTMLFormatChanged
+		}
+		count, err := strconv.ParseInt(trimmed[titleStart:titleStart+titleEnd], 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("%w: parse count: %w", errHTMLFormatChanged, err)
+		}
+		if count < 0 {
+			return 0, fmt.Errorf("%w: negative download count: %d", errHTMLFormatChanged, count)
+		}
+		return count, nil
 	}
 
-	if foundMarker {
-		return 0, errHTMLFormatChanged // marker was on the last line, no next line
-	}
 	return 0, errHTMLFormatChanged
 }
 

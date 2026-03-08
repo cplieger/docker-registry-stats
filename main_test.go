@@ -3,10 +3,12 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -143,6 +145,11 @@ func TestParseGHCRDownloads(t *testing.T) {
 		{
 			name:    "truncated at Total downloads",
 			html:    "<span>Total downloads</span>",
+			wantErr: errHTMLFormatChanged,
+		},
+		{
+			name:    "negative download count",
+			html:    "<span>Total downloads</span>\n<h3 title=\"-5\">-5</h3>",
 			wantErr: errHTMLFormatChanged,
 		},
 	}
@@ -352,6 +359,27 @@ func TestLoadSnapshotPathTraversal(t *testing.T) {
 	_, err := loadSnapshot("../../etc/passwd")
 	if err == nil {
 		t.Error("expected error for path traversal date")
+	}
+}
+
+func TestLoadSnapshotPathTraversalEdgeCases(t *testing.T) {
+	tests := []struct {
+		name string
+		date string
+	}{
+		{"dot-dot-slash", "../2026-03-06"},
+		{"encoded dots", "..%2F..%2Fetc%2Fpasswd"},
+		{"null byte", "2026-03-06\x00.json"},
+		{"backslash traversal", `..\..\etc\passwd`},
+		{"valid format but future", "9999-12-31"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := loadSnapshot(tt.date)
+			if err == nil && tt.name != "valid format but future" {
+				t.Errorf("expected error for %q", tt.date)
+			}
+		})
 	}
 }
 
@@ -683,6 +711,171 @@ func TestWriteJSONEmptySlice(t *testing.T) {
 
 	if got := w.Body.String(); got != "[]\n" {
 		t.Errorf("empty slice JSON = %q, want []\n", got)
+	}
+}
+
+// --- Filter edge case tests ---
+
+func TestRegistryIncludes(t *testing.T) {
+	tests := []struct {
+		filter   string
+		wantHub  bool
+		wantGHCR bool
+	}{
+		{"dockerhub", true, false},
+		{"ghcr", false, true},
+		{"", true, true},
+		{"$__all", true, true},
+		{"{dockerhub}", true, false},
+		{"{ghcr}", false, true},
+		{"unknown", true, true},
+		{"{$__all}", true, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.filter, func(t *testing.T) {
+			hub, ghcr := registryIncludes(tt.filter)
+			if hub != tt.wantHub || ghcr != tt.wantGHCR {
+				t.Errorf("registryIncludes(%q) = (%v, %v), want (%v, %v)",
+					tt.filter, hub, ghcr, tt.wantHub, tt.wantGHCR)
+			}
+		})
+	}
+}
+
+func TestParseRepoFilter(t *testing.T) {
+	tests := []struct {
+		name   string
+		values []string
+		want   int // -1 means nil (no filter)
+	}{
+		{"empty", nil, -1},
+		{"single value", []string{"owner/app"}, 1},
+		{"comma separated", []string{"a/b,c/d"}, 2},
+		{"repeated params", []string{"a/b", "c/d"}, 2},
+		{"grafana all", []string{"$__all"}, -1},
+		{"curly braces", []string{"{a/b,c/d}"}, 2},
+		{"empty string", []string{""}, -1},
+		{"whitespace in values", []string{" a/b , c/d "}, 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseRepoFilter(tt.values)
+			if tt.want == -1 {
+				if got != nil {
+					t.Errorf("expected nil filter, got %v", got)
+				}
+			} else if len(got) != tt.want {
+				t.Errorf("len = %d, want %d", len(got), tt.want)
+			}
+		})
+	}
+}
+
+func TestHandlePullsExcessiveRepoParams(t *testing.T) {
+	useTestDataDir(t)
+	seedSnapshot(t, "2026-03-06", testSnapshot(100, 50))
+
+	// Build a request with many repo params — should not panic or OOM
+	var b strings.Builder
+	b.WriteByte('?')
+	for i := range 100 {
+		if i > 0 {
+			b.WriteByte('&')
+		}
+		fmt.Fprintf(&b, "repo=fake/repo%d", i)
+	}
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/pulls"+b.String(), http.NoBody)
+	w := httptest.NewRecorder()
+	handlePulls(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", w.Code)
+	}
+	// All repos are filtered out (none match), so we should get an empty array
+	var rows []any
+	json.Unmarshal(w.Body.Bytes(), &rows)
+	if len(rows) != 0 {
+		t.Errorf("expected 0 rows for non-matching filters, got %d", len(rows))
+	}
+}
+
+func TestHandleSummaryWithRegistryFilter(t *testing.T) {
+	useTestDataDir(t)
+	seedSnapshot(t, "2026-03-06", testSnapshot(100, 50))
+
+	t.Run("dockerhub only", func(t *testing.T) {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/summary?registry=dockerhub", http.NoBody)
+		w := httptest.NewRecorder()
+		handleSummary(w, req)
+
+		var rows []struct{ Registry string }
+		json.Unmarshal(w.Body.Bytes(), &rows)
+		if len(rows) != 1 || rows[0].Registry != "dockerhub" {
+			t.Errorf("expected 1 dockerhub row, got %v", rows)
+		}
+	})
+
+	t.Run("ghcr only", func(t *testing.T) {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/summary?registry=ghcr", http.NoBody)
+		w := httptest.NewRecorder()
+		handleSummary(w, req)
+
+		var rows []struct{ Registry string }
+		json.Unmarshal(w.Body.Bytes(), &rows)
+		if len(rows) != 1 || rows[0].Registry != "ghcr" {
+			t.Errorf("expected 1 ghcr row, got %v", rows)
+		}
+	})
+}
+
+func TestHandleSnapshotNotFound(t *testing.T) {
+	useTestDataDir(t)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/snapshot?date=2099-01-01", http.NoBody)
+	w := httptest.NewRecorder()
+	handleSnapshot(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestHandlePullsDailySingleDay(t *testing.T) {
+	useTestDataDir(t)
+	seedSnapshot(t, "2026-03-06", testSnapshot(100, 50))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/pulls/daily", http.NoBody)
+	w := httptest.NewRecorder()
+	handlePullsDaily(w, req)
+
+	var rows []struct {
+		DailyPulls int64 `json:"daily_pulls"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &rows)
+
+	// First day should always have delta 0 (no previous day to compare)
+	for _, r := range rows {
+		if r.DailyPulls != 0 {
+			t.Errorf("single-day delta = %d, want 0", r.DailyPulls)
+		}
+	}
+}
+
+func TestFilteredPullsZeroDownloadsExcluded(t *testing.T) {
+	snap := &snapshot{
+		GHCR: []ghcrStats{
+			{Package: "owner/active", DownloadCount: 100},
+			{Package: "owner/empty", DownloadCount: 0},
+		},
+	}
+	pulls := filteredPulls(snap, nil, "")
+	for _, p := range pulls {
+		if p.Repo == "owner/empty" {
+			t.Error("GHCR packages with 0 downloads should be excluded from pulls")
+		}
+	}
+	if len(pulls) != 1 {
+		t.Errorf("expected 1 pull entry, got %d", len(pulls))
 	}
 }
 
