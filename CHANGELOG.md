@@ -14,6 +14,4 @@
 
 ### Added
 
-- Add wildcard support for Docker Hub and GHCR repos
-
 - Initial release
