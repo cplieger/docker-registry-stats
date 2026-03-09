@@ -1,7 +1,19 @@
 # Changelog
 
-## 2026.03.09 (2026-03-09)
+## 2026.03.07-e9dfac0 (2026-03-08)
+
+### Added
+
+- Add validation for negative download counts and path traversal edge cases
 
 ### Changed
 
-- Rebuilt with updated publishing pipeline
+- Refactor HTML parsing logic clarity
+
+## 2026.03.07-9112d85 (2026-03-07)
+
+### Added
+
+- Add wildcard support for Docker Hub and GHCR repos
+
+- Initial release
