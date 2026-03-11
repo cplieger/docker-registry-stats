@@ -28,6 +28,13 @@ This is a distroless, rootless container — it runs as `nonroot` on
 `gcr.io/distroless/static` with no shell or package manager. It has
 zero external Go dependencies (stdlib-only).
 
+**Example use case:** You publish Docker images to GHCR and Docker Hub
+and want to track download trends over time. Configure your repos
+(or use `owner/*` wildcards to auto-discover all of them), point
+Grafana at the HTTP API, and get a dashboard showing cumulative
+downloads, daily deltas, and per-package breakdowns — no external
+analytics service required.
+
 ### Limitations
 
 - **Public repositories only.** Docker Hub uses the unauthenticated API.
@@ -83,7 +90,7 @@ services:
       - "9100:9100"
 
     volumes:
-      - "${CONFIG_ROOT}/registry-stats:/data"  # daily JSON snapshots
+      - "/opt/appdata/registry-stats:/data"  # daily JSON snapshots
 
     healthcheck:
       test:

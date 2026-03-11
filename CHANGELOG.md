@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026.03.11 (2026-03-11)
+
+### Added
+
+- Add newline at end of compose.yaml file
+
+### Changed
+
+- Refactor(registry-stats): improve code documentation, storage safety, and result sorting
+- Refactor(registry-stats): optimize HTTP client and improve error handling
+- Migrate to structured logging and enhance validation
+
 ## 2026.03.10 (2026-03-10)
 
 ### Changed

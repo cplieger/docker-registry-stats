@@ -112,10 +112,10 @@ func TestDateToISO(t *testing.T) {
 
 func TestParseGHCRDownloads(t *testing.T) {
 	tests := []struct {
+		wantErr error
 		name    string
 		html    string
 		want    int64
-		wantErr error
 	}{
 		{
 			name: "valid large number",
@@ -310,6 +310,19 @@ func TestLoadConfigInvalidNumbers(t *testing.T) {
 	}
 }
 
+func TestLoadConfigNegativeNumbers(t *testing.T) {
+	t.Setenv("POLL_INTERVAL_HOURS", "-5")
+	t.Setenv("RETENTION_DAYS", "-10")
+	cfg := loadConfig()
+
+	if cfg.PollInterval != 1*time.Hour {
+		t.Errorf("PollInterval = %v, want 1h fallback for negative", cfg.PollInterval)
+	}
+	if cfg.RetentionDays != 90 {
+		t.Errorf("RetentionDays = %d, want 90 fallback for negative", cfg.RetentionDays)
+	}
+}
+
 func TestLoadConfigWildcard(t *testing.T) {
 	t.Setenv("DOCKERHUB_REPOS", "cplieger/*")
 	t.Setenv("GHCR_REPOS", "cplieger/*,cplieger/fclones")
@@ -371,12 +384,13 @@ func TestLoadSnapshotPathTraversalEdgeCases(t *testing.T) {
 		{"encoded dots", "..%2F..%2Fetc%2Fpasswd"},
 		{"null byte", "2026-03-06\x00.json"},
 		{"backslash traversal", `..\..\etc\passwd`},
+		// 9999-12-31 passes date validation but file won't exist — still errors
 		{"valid format but future", "9999-12-31"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := loadSnapshot(tt.date)
-			if err == nil && tt.name != "valid format but future" {
+			if err == nil {
 				t.Errorf("expected error for %q", tt.date)
 			}
 		})
@@ -416,9 +430,10 @@ func TestListDatesEmptyDir(t *testing.T) {
 func TestListDatesIgnoresNonDateFiles(t *testing.T) {
 	useTestDataDir(t)
 	seedSnapshot(t, "2026-03-06", testSnapshot(10, 5))
-	// Write a non-date JSON file that should be ignored
+	// Write files that should be ignored: non-date JSON, non-JSON, and temp files
 	os.WriteFile(filepath.Join(dataDir, "notes.json"), []byte("{}"), 0o600)
 	os.WriteFile(filepath.Join(dataDir, "readme.txt"), []byte("hi"), 0o600)
+	os.WriteFile(filepath.Join(dataDir, ".snapshot-abc123.tmp"), []byte("{}"), 0o600)
 
 	dates, err := listDates()
 	if err != nil {
@@ -464,16 +479,34 @@ func TestPruneSnapshotsZeroRetention(t *testing.T) {
 // --- HTTP handler tests ---
 
 func TestHandleHealth(t *testing.T) {
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/health", http.NoBody)
-	w := httptest.NewRecorder()
-	handleHealth(w, req)
+	orig := healthFile
+	healthFile = filepath.Join(t.TempDir(), ".healthy")
+	t.Cleanup(func() { healthFile = orig })
 
-	if w.Code != http.StatusOK {
-		t.Errorf("status = %d, want 200", w.Code)
-	}
-	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
-		t.Errorf("Content-Type = %s, want application/json", ct)
-	}
+	t.Run("healthy", func(t *testing.T) {
+		setHealthy(true)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/health", http.NoBody)
+		w := httptest.NewRecorder()
+		handleHealth(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Errorf("status = %d, want 200", w.Code)
+		}
+		if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+			t.Errorf("Content-Type = %s, want application/json", ct)
+		}
+	})
+
+	t.Run("unhealthy", func(t *testing.T) {
+		setHealthy(false)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/health", http.NoBody)
+		w := httptest.NewRecorder()
+		handleHealth(w, req)
+
+		if w.Code != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want 503", w.Code)
+		}
+	})
 }
 
 func TestHandleSnapshot(t *testing.T) {
@@ -538,6 +571,35 @@ func TestHandlePulls(t *testing.T) {
 	// 2 dates × (1 dockerhub + 1 ghcr) = 4 rows
 	if len(rows) != 4 {
 		t.Errorf("len = %d, want 4", len(rows))
+	}
+}
+
+func TestHandlePullsSortedOutput(t *testing.T) {
+	useTestDataDir(t)
+	// Snapshot with multiple repos to verify sort order
+	snap := snapshot{
+		Timestamp: time.Date(2026, 3, 6, 12, 0, 0, 0, time.UTC),
+		DockerHub: []repoStats{
+			{Repo: "z/repo", PullCount: 10},
+			{Repo: "a/repo", PullCount: 20},
+		},
+	}
+	seedSnapshot(t, "2026-03-06", snap)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/pulls", http.NoBody)
+	w := httptest.NewRecorder()
+	handlePulls(w, req)
+
+	var rows []struct {
+		Repo string `json:"repo"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &rows)
+	if len(rows) != 2 {
+		t.Fatalf("len = %d, want 2", len(rows))
+	}
+	// Should be sorted by repo name within the same timestamp
+	if rows[0].Repo != "a/repo" || rows[1].Repo != "z/repo" {
+		t.Errorf("rows not sorted: %v", rows)
 	}
 }
 

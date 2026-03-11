@@ -16,7 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"math/rand/v2"
 	"net/http"
 	"os"
@@ -35,6 +35,7 @@ const (
 	registryGHCR = "ghcr"
 )
 
+// healthFile and dataDir are vars (not consts) so tests can override them.
 var (
 	healthFile = "/tmp/.healthy"
 	dataDir    = "/data"
@@ -104,13 +105,12 @@ func main() {
 		os.Exit(0)
 	}
 
-	log.SetOutput(os.Stdout)
 	cfg := loadConfig()
 	logConfig(&cfg)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	defer os.Remove(healthFile)
+	defer setHealthy(false)
 
 	srv := startServer()
 
@@ -118,7 +118,7 @@ func main() {
 	pruneSnapshots(&cfg)
 
 	if cfg.PollInterval > 0 {
-		log.Printf("Scheduled mode: interval ~%s (±10%% jitter)", cfg.PollInterval)
+		slog.Info("scheduled mode", "interval", cfg.PollInterval, "jitter", "±10%")
 
 		for {
 			// Add ±10% jitter to avoid predictable access patterns
@@ -129,7 +129,7 @@ func main() {
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				log.Printf("Shutting down (%v)", context.Cause(ctx))
+				slog.Info("shutting down", "cause", context.Cause(ctx))
 				shutdownServer(srv)
 				return
 			case <-timer.C:
@@ -140,17 +140,18 @@ func main() {
 	}
 
 	<-ctx.Done()
-	log.Printf("Shutting down (%v)", context.Cause(ctx))
+	slog.Info("shutting down", "cause", context.Cause(ctx))
 	shutdownServer(srv)
 }
 
+// loadConfig reads configuration from environment variables with sensible defaults.
 func loadConfig() config {
 	retentionDays, err := strconv.Atoi(getEnv("RETENTION_DAYS", "90"))
-	if err != nil {
+	if err != nil || retentionDays < 0 {
 		retentionDays = 90
 	}
 	pollIntervalHours, err := strconv.Atoi(getEnv("POLL_INTERVAL_HOURS", "1"))
-	if err != nil {
+	if err != nil || pollIntervalHours < 0 {
 		pollIntervalHours = 1
 	}
 
@@ -162,16 +163,19 @@ func loadConfig() config {
 	}
 }
 
+// logConfig logs the active configuration at startup (no secrets to redact).
 func logConfig(cfg *config) {
-	log.Printf("Docker Hub: %d repo refs", len(cfg.DockerHubRepos))
 	for _, r := range cfg.DockerHubRepos {
-		log.Printf("  - %s/%s", r.Owner, r.Repo)
+		slog.Info("docker hub repo", "ref", r.Owner+"/"+r.Repo)
 	}
-	log.Printf("GHCR: %d package refs", len(cfg.GHCRRepos))
 	for _, r := range cfg.GHCRRepos {
-		log.Printf("  - %s/%s", r.Owner, r.Repo)
+		slog.Info("ghcr package", "ref", r.Owner+"/"+r.Repo)
 	}
-	log.Printf("Poll: %s | Retention: %d days", cfg.PollInterval, cfg.RetentionDays)
+	slog.Info("configuration loaded",
+		"docker_hub_refs", len(cfg.DockerHubRepos),
+		"ghcr_refs", len(cfg.GHCRRepos),
+		"poll_interval", cfg.PollInterval,
+		"retention_days", cfg.RetentionDays)
 }
 
 // parseRepoRefs parses a comma-separated list of "owner/repo" or "owner/*" pairs.
@@ -188,11 +192,11 @@ func parseRepoRefs(s string) []repoRef {
 		}
 		owner, repo, ok := strings.Cut(p, "/")
 		if !ok || owner == "" || repo == "" {
-			log.Printf("WARNING: skipping invalid repo ref (expected owner/repo or owner/*): %s", p)
+			slog.Warn("skipping invalid repo ref", "input", p, "expected", "owner/repo or owner/*")
 			continue
 		}
 		if !isSafeURLSegment(owner) || (repo != "*" && !isSafeURLSegment(repo)) {
-			log.Printf("WARNING: skipping repo ref with unsafe characters: %s", p)
+			slog.Warn("skipping repo ref with unsafe characters", "input", p)
 			continue
 		}
 		refs = append(refs, repoRef{Owner: owner, Repo: repo})
@@ -200,20 +204,27 @@ func parseRepoRefs(s string) []repoRef {
 	return refs
 }
 
+// isSafeURLSegment returns true if s contains no characters that could
+// break URL path construction or enable path traversal.
 func isSafeURLSegment(s string) bool {
 	return !strings.ContainsAny(s, "/%\\?#@:")
 }
 
 // --- Collection ---
 
+// httpClient is the shared HTTP client for all outbound requests.
+// Created once at startup for connection pooling.
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
+// collect runs a single collection cycle for all configured registries,
+// saves the snapshot, and returns true if all collections succeeded.
 func collect(ctx context.Context, cfg *config) bool {
-	log.Println("Starting collection")
-	client := &http.Client{Timeout: 30 * time.Second}
+	slog.Info("starting collection")
 	snap := snapshot{Timestamp: time.Now().UTC()}
 	ok := true
 
 	if len(cfg.DockerHubRepos) > 0 {
-		dh := collectDockerHub(ctx, client, cfg.DockerHubRepos)
+		dh := collectDockerHub(ctx, httpClient, cfg.DockerHubRepos)
 		if len(dh) == 0 {
 			ok = false
 		}
@@ -221,7 +232,7 @@ func collect(ctx context.Context, cfg *config) bool {
 	}
 
 	if len(cfg.GHCRRepos) > 0 {
-		gh, healthy := collectGHCR(ctx, client, cfg.GHCRRepos)
+		gh, healthy := collectGHCR(ctx, httpClient, cfg.GHCRRepos)
 		if !healthy {
 			ok = false
 		}
@@ -230,16 +241,20 @@ func collect(ctx context.Context, cfg *config) bool {
 
 	// Don't save empty snapshots — they corrupt daily delta calculations
 	if len(snap.DockerHub) == 0 && len(snap.GHCR) == 0 {
-		log.Println("ERROR: all collections failed, skipping snapshot save")
+		if len(cfg.DockerHubRepos) == 0 && len(cfg.GHCRRepos) == 0 {
+			slog.Warn("no repos configured, skipping snapshot save")
+		} else {
+			slog.Error("all collections failed, skipping snapshot save")
+		}
 		return false
 	}
 
 	if err := saveSnapshot(snap); err != nil {
-		log.Printf("ERROR: failed to save snapshot: %v", err)
+		slog.Error("failed to save snapshot", "error", err)
 		return false
 	}
 
-	log.Printf("Collection complete: docker_hub=%d ghcr=%d", len(snap.DockerHub), len(snap.GHCR))
+	slog.Info("collection complete", "docker_hub", len(snap.DockerHub), "ghcr", len(snap.GHCR))
 	return ok
 }
 
@@ -258,7 +273,7 @@ func collectDockerHub(ctx context.Context, client *http.Client, refs []repoRef) 
 		}
 		repos, err := listDockerHubRepos(ctx, client, ref.Owner)
 		if err != nil {
-			log.Printf("ERROR: Docker Hub listing failed for %s/*: %v", ref.Owner, err)
+			slog.Error("docker hub listing failed", "owner", ref.Owner, "error", err)
 			continue
 		}
 		for i, r := range repos {
@@ -268,9 +283,9 @@ func collectDockerHub(ctx context.Context, client *http.Client, refs []repoRef) 
 			seen[r.Repo] = true
 			repos[i].Tags = collectDockerHubTags(ctx, client, r.Repo)
 			results = append(results, repos[i])
-			log.Printf("Docker Hub: %s — %d pulls, %d tags", r.Repo, r.PullCount, len(repos[i].Tags))
+			slog.Info("docker hub repo collected", "repo", r.Repo, "pulls", r.PullCount, "tags", len(repos[i].Tags))
 		}
-		log.Printf("Docker Hub wildcard %s/*: discovered %d repos", ref.Owner, len(repos))
+		slog.Info("docker hub wildcard expanded", "owner", ref.Owner, "repos", len(repos))
 	}
 
 	// Collect explicit refs (skip if already covered by a wildcard)
@@ -287,7 +302,7 @@ func collectDockerHub(ctx context.Context, client *http.Client, refs []repoRef) 
 		repoURL := fmt.Sprintf("https://hub.docker.com/v2/repositories/%s/%s/", ref.Owner, ref.Repo)
 		repoData, err := doGet(ctx, client, repoURL)
 		if err != nil {
-			log.Printf("ERROR: Docker Hub fetch failed for %s: %v", name, err)
+			slog.Error("docker hub fetch failed", "repo", name, "error", err)
 			continue
 		}
 
@@ -296,7 +311,7 @@ func collectDockerHub(ctx context.Context, client *http.Client, refs []repoRef) 
 			PullCount   int64  `json:"pull_count"`
 		}
 		if err := json.Unmarshal(repoData, &repoResp); err != nil {
-			log.Printf("ERROR: Docker Hub parse failed for %s: %v", name, err)
+			slog.Error("docker hub parse failed", "repo", name, "error", err)
 			continue
 		}
 
@@ -307,7 +322,7 @@ func collectDockerHub(ctx context.Context, client *http.Client, refs []repoRef) 
 			LastUpdated: repoResp.LastUpdated,
 			Tags:        tags,
 		})
-		log.Printf("Docker Hub: %s — %d pulls, %d tags", name, repoResp.PullCount, len(tags))
+		slog.Info("docker hub repo collected", "repo", name, "pulls", repoResp.PullCount, "tags", len(tags))
 	}
 
 	return results
@@ -365,7 +380,7 @@ func collectDockerHubTags(ctx context.Context, client *http.Client, repo string)
 			repo, page)
 		data, err := doGet(ctx, client, tagsURL)
 		if err != nil {
-			log.Printf("ERROR: Docker Hub tags fetch failed for %s page %d: %v", repo, page, err)
+			slog.Error("docker hub tags fetch failed", "repo", repo, "page", page, "error", err)
 			break
 		}
 
@@ -374,7 +389,7 @@ func collectDockerHubTags(ctx context.Context, client *http.Client, repo string)
 			Results []tagInfo `json:"results"`
 		}
 		if err := json.Unmarshal(data, &resp); err != nil {
-			log.Printf("ERROR: Docker Hub tags parse failed for %s: %v", repo, err)
+			slog.Error("docker hub tags parse failed", "repo", repo, "error", err)
 			break
 		}
 
@@ -406,7 +421,7 @@ func collectGHCR(ctx context.Context, client *http.Client, refs []repoRef) ([]gh
 		}
 		names, err := scrapeGHCRPackageList(ctx, client, ref.Owner)
 		if err != nil {
-			log.Printf("ERROR: GHCR package listing failed for %s/*: %v", ref.Owner, err)
+			slog.Error("ghcr package listing failed", "owner", ref.Owner, "error", err)
 			continue
 		}
 		for _, name := range names {
@@ -416,7 +431,7 @@ func collectGHCR(ctx context.Context, client *http.Client, refs []repoRef) ([]gh
 				packages = append(packages, repoRef{Owner: ref.Owner, Repo: name})
 			}
 		}
-		log.Printf("GHCR wildcard %s/*: discovered %d packages", ref.Owner, len(names))
+		slog.Info("ghcr wildcard expanded", "owner", ref.Owner, "packages", len(names))
 	}
 	for _, ref := range refs {
 		if ref.Repo == "*" {
@@ -445,7 +460,7 @@ func collectGHCR(ctx context.Context, client *http.Client, refs []repoRef) ([]gh
 		total++
 		downloads, err := scrapeGHCRDownloads(ctx, client, ref.Owner, ref.Repo)
 		if err != nil {
-			log.Printf("WARNING: GHCR scrape failed for %s/%s: %v", ref.Owner, ref.Repo, err)
+			slog.Warn("ghcr scrape failed", "package", ref.Owner+"/"+ref.Repo, "error", err)
 			failures++
 			if errors.Is(err, errHTMLFormatChanged) {
 				parseFailures++
@@ -456,12 +471,11 @@ func collectGHCR(ctx context.Context, client *http.Client, refs []repoRef) ([]gh
 			Package:       ref.Owner + "/" + ref.Repo,
 			DownloadCount: downloads,
 		})
-		log.Printf("GHCR: %s/%s — %d downloads", ref.Owner, ref.Repo, downloads)
+		slog.Info("ghcr package collected", "package", ref.Owner+"/"+ref.Repo, "downloads", downloads)
 	}
 
 	if total > 0 && parseFailures == total {
-		log.Println("ERROR: GHCR HTML format may have changed — all download scrapes failed")
-		log.Println("ERROR: please open an issue at https://github.com/cplieger/docker-registry-stats/issues so the maintainer can update the scraper")
+		slog.Error("ghcr HTML format may have changed, all download scrapes failed")
 	}
 
 	healthy := total == 0 || failures < total
@@ -493,6 +507,7 @@ func fetchGitHubHTML(ctx context.Context, client *http.Client, pageURL string) (
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		drainBody(resp.Body)
 		return "", fmt.Errorf("page returned HTTP %d", resp.StatusCode)
 	}
 
@@ -597,38 +612,70 @@ func parseGHCRDownloads(html string) (int64, error) {
 
 // --- Storage ---
 
+// saveSnapshot atomically writes a snapshot to the data directory as YYYY-MM-DD.json.
 func saveSnapshot(snap snapshot) error {
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return fmt.Errorf("create data dir: %w", err)
 	}
 
 	filename := snap.Timestamp.Format("2006-01-02") + ".json"
-	path := filepath.Join(dataDir, filename)
+	destPath := filepath.Join(dataDir, filename)
 
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal snapshot: %w", err)
 	}
 
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	// Atomic write: temp file + rename prevents corruption on crash.
+	tmp, err := os.CreateTemp(dataDir, ".snapshot-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
 		return fmt.Errorf("write temp snapshot: %w", err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("close temp snapshot: %w", err)
+	}
+	if err := os.Rename(tmpName, destPath); err != nil {
+		os.Remove(tmpName)
 		return fmt.Errorf("rename snapshot: %w", err)
 	}
 
-	log.Printf("Snapshot saved: %s", path)
+	slog.Info("snapshot saved", "file", filename)
 	return nil
 }
 
+// loadSnapshot reads and parses a snapshot file for the given date (YYYY-MM-DD).
+// Validates the date format to prevent path traversal, and caps file size at 50 MB.
 func loadSnapshot(date string) (*snapshot, error) {
 	if _, err := time.Parse("2006-01-02", date); err != nil {
-		return nil, fmt.Errorf("invalid date format: %s", date)
+		return nil, fmt.Errorf("invalid date format %q: %w", date, err)
 	}
 	path := filepath.Join(dataDir, date+".json")
-	data, err := os.ReadFile(path)
+
+	// Single file handle avoids TOCTOU between stat and read.
+	const maxSnapshotSize = 50 << 20 // 50 MB
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() > maxSnapshotSize {
+		return nil, fmt.Errorf("snapshot too large: %d bytes", info.Size())
+	}
+
+	data, err := io.ReadAll(io.LimitReader(f, maxSnapshotSize))
 	if err != nil {
 		return nil, err
 	}
@@ -639,6 +686,8 @@ func loadSnapshot(date string) (*snapshot, error) {
 	return &snap, nil
 }
 
+// listDates returns all snapshot dates in the data directory, sorted chronologically.
+// Skips non-date filenames, directories, and temp files from atomic writes.
 func listDates() ([]string, error) {
 	entries, err := os.ReadDir(dataDir)
 	if err != nil {
@@ -649,10 +698,11 @@ func listDates() ([]string, error) {
 	}
 	var dates []string
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".json") || strings.HasPrefix(name, ".") {
 			continue
 		}
-		date := strings.TrimSuffix(e.Name(), ".json")
+		date := strings.TrimSuffix(name, ".json")
 		if _, err := time.Parse("2006-01-02", date); err != nil {
 			continue
 		}
@@ -662,6 +712,7 @@ func listDates() ([]string, error) {
 	return dates, nil
 }
 
+// pruneSnapshots deletes snapshot files older than the configured retention period.
 func pruneSnapshots(cfg *config) {
 	if cfg.RetentionDays <= 0 {
 		return
@@ -669,7 +720,7 @@ func pruneSnapshots(cfg *config) {
 	cutoff := time.Now().UTC().AddDate(0, 0, -cfg.RetentionDays).Format("2006-01-02")
 	dates, err := listDates()
 	if err != nil {
-		log.Printf("ERROR: failed to list dates for pruning: %v", err)
+		slog.Error("failed to list dates for pruning", "error", err)
 		return
 	}
 	pruned := 0
@@ -677,19 +728,20 @@ func pruneSnapshots(cfg *config) {
 		if date < cutoff {
 			path := filepath.Join(dataDir, date+".json")
 			if err := os.Remove(path); err != nil {
-				log.Printf("ERROR: failed to prune snapshot %s: %v", date, err)
+				slog.Error("failed to prune snapshot", "date", date, "error", err)
 			} else {
 				pruned++
 			}
 		}
 	}
 	if pruned > 0 {
-		log.Printf("Pruned %d old snapshots (retention: %d days)", pruned, cfg.RetentionDays)
+		slog.Info("pruned old snapshots", "count", pruned, "retention_days", cfg.RetentionDays)
 	}
 }
 
 // --- HTTP API ---
 
+// startServer creates and starts the HTTP API server in a background goroutine.
 func startServer() *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", handleHealth)
@@ -705,38 +757,47 @@ func startServer() *http.Server {
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	go func() {
-		log.Printf("HTTP server starting on %s", listenAddr)
+		slog.Info("http server starting", "addr", listenAddr)
 		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("ERROR: HTTP server: %v", err)
+			slog.Error("http server error", "error", err)
 		}
 	}()
 
 	return srv
 }
 
+// shutdownServer gracefully shuts down the HTTP server with a 5-second timeout.
 func shutdownServer(srv *http.Server) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
-		log.Printf("ERROR: HTTP server shutdown: %v", err)
+		slog.Error("http server shutdown error", "error", err)
 	}
 }
 
+// dateToISO converts a YYYY-MM-DD date string to ISO 8601 format for Grafana.
 func dateToISO(date string) string {
 	return date + "T00:00:00Z"
 }
 
 func handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	if _, err := os.Stat(healthFile); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, `{"status":"unhealthy"}`)
+		return
+	}
 	fmt.Fprint(w, `{"status":"ok"}`)
 }
 
 func handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	snap, err := resolveSnapshot(r.URL.Query().Get("date"))
 	if err != nil {
+		slog.Warn("snapshot not found", "date", r.URL.Query().Get("date"), "error", err)
 		http.Error(w, "snapshot not found", http.StatusNotFound)
 		return
 	}
@@ -822,6 +883,7 @@ func handlePulls(w http.ResponseWriter, r *http.Request) {
 	registryFilter := r.URL.Query().Get("registry")
 	dates, err := listDates()
 	if err != nil {
+		slog.Error("failed to list dates", "error", err)
 		http.Error(w, "failed to list dates", http.StatusInternalServerError)
 		return
 	}
@@ -836,6 +898,7 @@ func handlePulls(w http.ResponseWriter, r *http.Request) {
 	for _, date := range dates {
 		snap, err := loadSnapshot(date)
 		if err != nil {
+			slog.Warn("skipping corrupt snapshot", "date", date, "error", err)
 			continue
 		}
 		ts := dateToISO(date)
@@ -848,6 +911,13 @@ func handlePulls(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	slices.SortFunc(rows, func(a, b row) int {
+		if a.Timestamp != b.Timestamp {
+			return strings.Compare(a.Timestamp, b.Timestamp)
+		}
+		return strings.Compare(a.Repo, b.Repo)
+	})
+
 	writeJSON(w, rows)
 }
 
@@ -856,6 +926,7 @@ func handlePullsDaily(w http.ResponseWriter, r *http.Request) {
 	registryFilter := r.URL.Query().Get("registry")
 	dates, err := listDates()
 	if err != nil {
+		slog.Error("failed to list dates", "error", err)
 		http.Error(w, "failed to list dates", http.StatusInternalServerError)
 		return
 	}
@@ -869,6 +940,7 @@ func handlePullsDaily(w http.ResponseWriter, r *http.Request) {
 	for _, date := range dates {
 		snap, err := loadSnapshot(date)
 		if err != nil {
+			slog.Warn("skipping corrupt snapshot", "date", date, "error", err)
 			continue
 		}
 		for _, rp := range filteredPulls(snap, repoFilter, registryFilter) {
@@ -912,6 +984,7 @@ func handleSummary(w http.ResponseWriter, r *http.Request) {
 	registryFilter := r.URL.Query().Get("registry")
 	snap, err := resolveSnapshot(r.URL.Query().Get("date"))
 	if err != nil {
+		slog.Warn("snapshot not found", "date", r.URL.Query().Get("date"), "error", err)
 		http.Error(w, "snapshot not found", http.StatusNotFound)
 		return
 	}
@@ -951,6 +1024,13 @@ func handleSummary(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	slices.SortFunc(rows, func(a, b row) int {
+		if a.Registry != b.Registry {
+			return strings.Compare(a.Registry, b.Registry)
+		}
+		return strings.Compare(a.Name, b.Name)
+	})
+
 	writeJSON(w, rows)
 }
 
@@ -961,10 +1041,21 @@ func resolveSnapshot(date string) (*snapshot, error) {
 		return loadSnapshot(date)
 	}
 	dates, err := listDates()
-	if err != nil || len(dates) == 0 {
+	if err != nil {
+		return nil, fmt.Errorf("list dates: %w", err)
+	}
+	if len(dates) == 0 {
 		return nil, errors.New("no snapshots available")
 	}
 	return loadSnapshot(dates[len(dates)-1])
+}
+
+// drainBody reads and discards up to 8 KB of a response body to enable
+// HTTP connection reuse.
+func drainBody(body io.ReadCloser) {
+	if _, err := io.CopyN(io.Discard, body, 8<<10); err != nil && !errors.Is(err, io.EOF) {
+		slog.Warn("failed to drain response body", "error", err)
+	}
 }
 
 func doGet(ctx context.Context, client *http.Client, reqURL string) ([]byte, error) {
@@ -979,6 +1070,7 @@ func doGet(ctx context.Context, client *http.Client, reqURL string) ([]byte, err
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		drainBody(resp.Body)
 		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, reqURL)
 	}
 
@@ -994,10 +1086,11 @@ func doGet(ctx context.Context, client *http.Client, reqURL string) ([]byte, err
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(v); err != nil {
-		log.Printf("ERROR: failed to write JSON response: %v", err)
+		slog.Error("failed to write JSON response", "error", err)
 	}
 }
 
+// setHealthy creates or removes the health marker file.
 func setHealthy(ok bool) {
 	if ok {
 		if f, err := os.Create(healthFile); err == nil {

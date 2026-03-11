@@ -4,9 +4,7 @@ FROM --platform=$BUILDPLATFORM golang:1.26-alpine@sha256:2389ebfa5b7f43eeafbd6be
 WORKDIR /src
 ARG TARGETOS
 ARG TARGETARCH
-COPY go.mod ./
-RUN go mod download
-COPY main.go ./
+COPY go.mod main.go ./
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /registry-stats main.go
