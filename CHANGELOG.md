@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026.03.12-0de7110 (2026-03-12)
+
+### Fixed
+
+- Improve startup health state and graceful shutdown handling
+
 ## 2026.03.11-116b511 (2026-03-11)
 
 ### Added

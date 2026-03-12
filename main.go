@@ -110,7 +110,11 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	defer setHealthy(false)
+
+	// Remove stale health file from a previous run that may have crashed
+	// before its defer ran. Without this, the health probe would report
+	// healthy before the first collection completes.
+	setHealthy(false)
 
 	srv := startServer()
 
@@ -129,8 +133,7 @@ func main() {
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				slog.Info("shutting down", "cause", context.Cause(ctx))
-				shutdownServer(srv)
+				shutdown(ctx, srv)
 				return
 			case <-timer.C:
 				setHealthy(collect(ctx, &cfg))
@@ -140,8 +143,7 @@ func main() {
 	}
 
 	<-ctx.Done()
-	slog.Info("shutting down", "cause", context.Cause(ctx))
-	shutdownServer(srv)
+	shutdown(ctx, srv)
 }
 
 // loadConfig reads configuration from environment variables with sensible defaults.
@@ -777,6 +779,14 @@ func shutdownServer(srv *http.Server) {
 	if err := srv.Shutdown(ctx); err != nil {
 		slog.Error("http server shutdown error", "error", err)
 	}
+}
+
+// shutdown marks the service unhealthy (so the orchestrator stops routing
+// traffic), then gracefully shuts down the HTTP server.
+func shutdown(ctx context.Context, srv *http.Server) {
+	slog.Info("shutting down", "cause", context.Cause(ctx))
+	setHealthy(false)
+	shutdownServer(srv)
 }
 
 // dateToISO converts a YYYY-MM-DD date string to ISO 8601 format for Grafana.
