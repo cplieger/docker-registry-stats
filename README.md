@@ -359,7 +359,7 @@ Issues, suggestions, and pull requests are welcome.
 
 ## Credits
 
-This is an original tool that integrates with [Docker Hub API](https://docs.docker.com/docker-hub/api/latest/). Thanks to the Docker Hub API maintainers for building the platform this tool extends.
+This is an original tool that builds upon [Docker Hub API](https://docs.docker.com/docker-hub/api/latest/).
 
 ## Disclaimer
 
