@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026.03.13-7a83b5f (2026-03-14)
+
+### Added
+
+- Test(registry-stats): add property-based and edge case tests
+- Test(registry-stats): add comprehensive test coverage for filtering and API handlers
+
+### Changed
+
+- Test(registry-stats): simplify conditional logic with switch statements
+
 ## 2026.03.12-0de7110 (2026-03-12)
 
 ### Fixed

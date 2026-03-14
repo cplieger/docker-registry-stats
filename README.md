@@ -335,6 +335,32 @@ docker inspect --format='{{json .State.Health.Log}}' registry-stats | python3 -m
 | Docker | `/registry-stats health` | Exit 0 = last collection succeeded |
 
 
+## Code Quality
+
+| Metric | Value |
+|--------|-------|
+| [Test Coverage](https://go.dev/blog/cover) | 87.7% |
+| Tests | 202 |
+| [Cyclomatic Complexity](https://en.wikipedia.org/wiki/Cyclomatic_complexity) (avg) | 4.0 |
+| [Cognitive Complexity](https://www.sonarsource.com/docs/CognitiveComplexity.pdf) (avg) | 4.1 |
+| [Mutation Efficacy](https://en.wikipedia.org/wiki/Mutation_testing) | 100% |
+| Test Framework | Property-based ([rapid](https://github.com/flyingmutant/rapid)) + table-driven |
+
+Tests cover all HTTP API endpoints (health, summary, pulls,
+pulls/daily, snapshot) with registry and repo filtering, snapshot
+persistence (save, load, list, prune with boundary dates, path
+traversal rejection), Docker Hub and GHCR collection (wildcard
+expansion, pagination, partial failures, deduplication), daily
+delta calculation with counter-reset clamping, config validation,
+and JSON serialization round-trips. Property-based tests verify
+that parsing functions never panic on arbitrary input and that
+URL segments are safely validated.
+
+Not tested: `main()` and the HTTP server bind — thin runtime
+wrappers around the tested core logic. GHCR HTML scraping is
+tested against captured page fragments but may break if GitHub
+changes their markup.
+
 ## Dependencies
 
 All dependencies are updated automatically via [Renovate](https://github.com/renovatebot/renovate) and pinned by digest or version for reproducibility.
