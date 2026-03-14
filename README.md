@@ -81,8 +81,8 @@ services:
 
     environment:
       TZ: "Europe/Paris"
-      DOCKERHUB_REPOS: "owner1/*,owner2/app2"  # owner/repo or owner/* format, comma-separated
-      GHCR_REPOS: "owner1/*,owner2/app2"  # owner/package or owner/* format, comma-separated
+      DOCKERHUB_REPOS: "\\owner1/*,owner2/app2"  # owner/repo or owner/* format, comma-separated
+      GHCR_REPOS: "\\owner1/*,owner2/app2"  # owner/package or owner/* format, comma-separated
       POLL_INTERVAL_HOURS: "1"  # 0 = collect once then serve
       RETENTION_DAYS: "90"  # 0 = keep forever
 
@@ -134,8 +134,8 @@ services:
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
 | `TZ` | Container timezone | `Europe/Paris` | No |
-| `DOCKERHUB_REPOS` | Comma-separated list of Docker Hub repositories to track. Use `owner/repo` for specific repos or `owner/*` to auto-discover all public repos for an owner (e.g. `myuser/*,otheruser/specific-app`) | `owner1/*,owner2/app2` | No |
-| `GHCR_REPOS` | Comma-separated list of public GHCR packages to track. Use `owner/package` for specific packages or `owner/*` to auto-discover all public packages for an owner (e.g. `myuser/*,otheruser/specific-app`) | `owner1/*,owner2/app2` | No |
+| `DOCKERHUB_REPOS` | Comma-separated list of Docker Hub repositories to track. Use `owner/repo` for specific repos or `owner/*` to auto-discover all public repos for an owner (e.g. `myuser/*,otheruser/specific-app`) | `\owner1/*,owner2/app2` | No |
+| `GHCR_REPOS` | Comma-separated list of public GHCR packages to track. Use `owner/package` for specific packages or `owner/*` to auto-discover all public packages for an owner (e.g. `myuser/*,otheruser/specific-app`) | `\owner1/*,owner2/app2` | No |
 | `POLL_INTERVAL_HOURS` | Hours between collection cycles. Set to 0 to collect once and then only serve the API (no recurring polls). Wildcards are re-expanded on each cycle, picking up newly published images | `1` | No |
 | `RETENTION_DAYS` | Number of days to keep snapshot files. Older snapshots are automatically deleted. Set to 0 to keep all snapshots forever | `90` | No |
 
@@ -343,7 +343,7 @@ docker inspect --format='{{json .State.Health.Log}}' registry-stats | python3 -m
 | Tests | 202 |
 | [Cyclomatic Complexity](https://en.wikipedia.org/wiki/Cyclomatic_complexity) (avg) | 4.0 |
 | [Cognitive Complexity](https://www.sonarsource.com/docs/CognitiveComplexity.pdf) (avg) | 4.1 |
-| [Mutation Efficacy](https://en.wikipedia.org/wiki/Mutation_testing) | 100% |
+| [Mutation Efficacy](https://en.wikipedia.org/wiki/Mutation_testing) | 84.7% (59 runs) |
 | Test Framework | Property-based ([rapid](https://github.com/flyingmutant/rapid)) + table-driven |
 
 Tests cover all HTTP API endpoints (health, summary, pulls,
