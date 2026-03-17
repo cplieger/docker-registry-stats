@@ -361,6 +361,34 @@ wrappers around the tested core logic. GHCR HTML scraping is
 tested against captured page fragments but may break if GitHub
 changes their markup.
 
+## Security Review
+
+**No vulnerabilities found.** All scans clean across 8 tools.
+
+| Tool | Result |
+|------|--------|
+| [govulncheck](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck) | No vulnerabilities in call graph |
+| [golangci-lint](https://golangci-lint.run/) (gosec) | 0 issues |
+| [trivy](https://trivy.dev/) | 0 vulnerabilities (distroless base) |
+| [grype](https://github.com/anchore/grype) | 0 vulnerabilities |
+| [gitleaks](https://github.com/gitleaks/gitleaks) | No secrets detected |
+| [semgrep](https://semgrep.dev/) | 1 info (false positive) |
+| [hadolint](https://github.com/hadolint/hadolint) | Clean |
+
+Read-only JSON API designed for internal Grafana consumption.
+No authentication required (standard for internal metrics APIs).
+Stdlib-only (zero external Go dependencies). Runs as `nonroot`
+on a distroless base image with no shell.
+
+**Details for advanced users:** URL path segments validated via
+`isSafeURLSegment` (rejects `/%\?#@:`). Snapshot filenames are
+date-format-validated before disk access (prevents path
+traversal). Response bodies capped via `io.LimitReader` (10 MB
+JSON, 4 MB HTML). HTTP server sets all five timeouts. Atomic
+writes (temp file + rename) prevent snapshot corruption. Semgrep
+flags `math/rand/v2` usage, which is correct for jitter timing
+(not crypto).
+
 ## Dependencies
 
 All dependencies are updated automatically via [Renovate](https://github.com/renovatebot/renovate) and pinned by digest or version for reproducibility.
