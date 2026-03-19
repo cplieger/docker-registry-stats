@@ -1,8 +1,8 @@
-# docker-registry-stats
+# registry-stats
 
 ![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue)
-[![GitHub release](https://img.shields.io/github/v/release/cplieger/docker-registry-stats)](https://github.com/cplieger/docker-registry-stats/releases)
-[![Image Size](https://ghcr-badge.egpl.dev/cplieger/registry-stats/size)](https://github.com/cplieger/docker-registry-stats/pkgs/container/registry-stats)
+[![GitHub release](https://img.shields.io/github/v/release/cplieger/registry-stats)](https://github.com/cplieger/registry-stats/releases)
+[![Image Size](https://ghcr-badge.egpl.dev/cplieger/registry-stats/size)](https://github.com/cplieger/registry-stats/pkgs/container/registry-stats)
 ![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue)
 ![base: Distroless](https://img.shields.io/badge/base-Distroless_nonroot-4285F4?logo=google)
 
