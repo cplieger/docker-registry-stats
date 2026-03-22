@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026.03.21-220833f (2026-03-22)
+
+### Changed
+
+- Remove unnecessary blank line
+- Refactor(subflux): enhance code review workflow and strengthen test coverage
+
 ## 2026.03.15-ef81144 (2026-03-16)
 
 ### Dependencies

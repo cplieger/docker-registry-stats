@@ -659,7 +659,14 @@ func loadSnapshot(date string) (*snapshot, error) {
 	if _, err := time.Parse("2006-01-02", date); err != nil {
 		return nil, fmt.Errorf("invalid date format %q: %w", date, err)
 	}
-	path := filepath.Join(dataDir, date+".json")
+	filename := date + ".json"
+	path := filepath.Join(dataDir, filename)
+	// Defense-in-depth: verify the resolved path stays inside dataDir.
+	// time.Parse already constrains date to digits+hyphens, but this guards
+	// against future refactors that might weaken the validation above.
+	if filepath.Dir(path) != filepath.Clean(dataDir) {
+		return nil, fmt.Errorf("path traversal blocked: %q", date)
+	}
 
 	// Single file handle avoids TOCTOU between stat and read.
 	const maxSnapshotSize = 50 << 20 // 50 MB
