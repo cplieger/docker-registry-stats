@@ -1,5 +1,5 @@
 module registry-stats
 
-go 1.26.1
+go 1.26.2
 
 require pgregory.net/rapid v1.2.0
